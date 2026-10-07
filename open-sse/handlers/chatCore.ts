@@ -16,6 +16,7 @@ import {
   readCpaAuthIndex,
   type FailureUsageAggregate,
 } from "./chatCore/failureUsage.ts";
+import { createPersistFailureUsage } from "./chatCore/persistFailureUsage.ts";
 import { createTranslationFailureResult } from "./chatCore/translationFailure.ts";
 import {
   estimateCalibratedFinalInputTokens,
@@ -62,6 +63,9 @@ import {
   isClaudeCodeOriginatedHeaders,
 } from "../config/codexIdentity.ts";
 import { trackDevice, extractIpFromHeaders } from "../services/deviceTracker.ts";
+import { trackRequestDevice } from "./chatCore/deviceTracking.ts";
+import { finalizeTranslatedRequest } from "./chatCore/translatedRequestFinalize.ts";
+import { stripCodexOutputEffort } from "./chatCore/codexOutputEffort.ts";
 import { getCombosCached } from "./chatCore/comboContextCache.ts";
 export { clearCombosCache, clearUpstreamProxyConfigCache } from "./chatCore/comboContextCache.ts";
 import { resolveAccountSemaphoreKey } from "./chatCore/executorHelpers.ts";
@@ -117,6 +121,8 @@ import { createStreamController } from "../utils/streamHandler.ts";
 import * as streamFailure from "../utils/streamFailureFinalization.ts";
 import { normalizeUsage } from "../utils/usageTracking.ts";
 import { refreshWithRetry, runWithOnPersist, runWithCasGuard } from "../services/tokenRefresh.ts";
+import { runCredentialRefreshRetry } from "./chatCore/credentialRefreshRetry.ts";
+import { applyProviderFailureClassification as applyProviderFailureClassificationLeaf } from "./chatCore/providerFailureClassification.ts";
 import { createRequestLogger } from "../utils/requestLogger.ts";
 import { createPreparedRequestLogger } from "../utils/providerRequestLogging.ts";
 import { summarizeToolSources } from "../utils/toolSources.ts";
@@ -247,6 +253,7 @@ import { recordNonStreamingUsageStats } from "./chatCore/nonStreamingUsageStats.
 import { getModelNormalizeToolCallId, getModelPreserveOpenAIDeveloperRole } from "@/lib/db/models";
 import { extractSessionAffinityKey } from "@/sse/services/auth";
 import { assertExclusiveConnectionLeaseFence } from "@/lib/db/exclusiveConnectionLeases";
+import { createManagedLeaseFence } from "./chatCore/managedLeaseFence.ts";
 
 import { getCacheControlSettings } from "@/lib/cacheControlSettings";
 import { guardrailRegistry } from "@/lib/guardrails";
@@ -260,6 +267,8 @@ import {
   resolveConnectionCacheOverride,
 } from "../utils/cacheControlPolicy.ts";
 import { getCachedSettings } from "@/lib/db/readCache";
+import { applyCustomSystemPrompt } from "./chatCore/customSystemPrompt.ts";
+import { runPluginRequestGate } from "./chatCore/pluginRequestGate.ts";
 import { applyCodexGlobalFastServiceTier } from "@/lib/providers/codexFastTier";
 import { buildUpstreamHeadersForExecute as buildUpstreamHeadersForExecuteFor } from "./chatCore/upstreamExecuteHeaders.ts";
 import {
@@ -284,6 +293,8 @@ import {
 import { saveIdempotency } from "@/lib/idempotencyLayer";
 
 import { computeRequestHash, shouldDeduplicate } from "../services/requestDedup.ts";
+import { runRequestDedup } from "./chatCore/requestDedup.ts";
+import { applyPostTranslationCompression } from "./chatCore/postTranslationCompression.ts";
 import {
   compressContext,
   estimateTokens,
@@ -470,98 +481,27 @@ async function handleChatCoreInner({
         : null;
     return credentialConnectionId || connectionId || null;
   };
-  const assertManagedLeaseFence = (attemptConnectionId: string | null | undefined) => {
-    if (!managedLease) return;
-    if (!attemptConnectionId) {
-      throw Object.assign(new Error("Managed lease connection is unavailable"), {
-        code: "LEASE_CONNECTION_MISMATCH",
-        status: 409,
-      });
-    }
-    const fence = assertExclusiveConnectionLeaseFence({
-      leaseOwnerId: managedLease.context.leaseOwnerId,
-      generation: managedLease.context.generation,
-      apiKeyId: managedLease.apiKeyId,
-      connectionId: attemptConnectionId,
-    });
-    if (fence.kind === "VALID") return;
-    const code =
-      fence.kind === "REQUIRED"
-        ? "LEASE_REQUIRED"
-        : fence.kind === "STALE"
-          ? "LEASE_FENCE_STALE"
-          : fence.kind === "AUTHORIZATION_MISMATCH"
-            ? "LEASE_AUTHORIZATION_MISMATCH"
-            : "LEASE_CONNECTION_MISMATCH";
-    throw Object.assign(new Error("Managed lease request fence rejected the dispatch"), {
-      code,
-      status: 409,
-    });
-  };
-  const getManagedLeaseFenceErrorCode = (code: string | undefined): string | undefined => {
-    if (managedLease === null) return undefined;
-    return code?.startsWith("LEASE_") ? code : undefined;
-  };
-  const managedLeaseFenceErrorResult = (code: string) => {
-    return {
-      ...createErrorResult(409, "Managed lease request fence rejected the dispatch", null, code),
-      errorType: "lease_error",
-      errorCode: code,
-    };
-  };
+  const { assertManagedLeaseFence, getManagedLeaseFenceErrorCode, managedLeaseFenceErrorResult } =
+    createManagedLeaseFence({ managedLease, createErrorResult });
+
   let tokensCompressed: number | null = null;
-  // ── Per-endpoint custom system prompt (port of upstream #2063) ──
-  // Reads from cachedSettings if available (passed in from combo/chat layer)
-  // to avoid an extra DB read on the hot path. Falls through to getCachedSettings()
-  // only when this function is called outside the normal chat dispatch.
-  {
-    const _s = cachedSettings ?? (await getCachedSettings());
-    if (
-      _s.customSystemPromptEnabled === true &&
-      typeof _s.customSystemPrompt === "string" &&
-      _s.customSystemPrompt
-    ) {
-      body = injectCustomSystemPrompt(body as Record<string, unknown>, _s.customSystemPrompt);
-      log?.debug?.("CUSTOMSP", "custom system prompt injected");
-    }
-  }
-  // ── Plugin onRequest hook ──
-  // Dynamic import cached by Node.js after first call — minimal overhead
-  const pluginGate = await runPluginOnRequestHook({
+  body = await applyCustomSystemPrompt({ body: body as Record<string, unknown>, cachedSettings, log });
+
+  const pluginRequestGate = await runPluginRequestGate({
     requestId: traceId,
-    body,
+    body: body as Record<string, unknown>,
     model,
     provider,
     apiKeyInfo,
     headers: clientRawRequest?.headers,
     log,
   });
-  if (pluginGate.blocked === true) {
-    return {
-      success: false,
-      status: 403,
-      // Label the source: this 403 is our own policy decision, not the provider
-      // rejecting us. Unlabelled, it is indistinguishable from a real upstream 403
-      // and gets the connection banned. Matches the type already sent to the client
-      // in pluginOnRequest.ts.
-      errorType: "plugin_block",
-      errorCode: "plugin_block",
-      error: "Request blocked by plugin",
-      response: pluginGate.response,
-    };
-  }
-  if (pluginGate.body) {
-    body = pluginGate.body;
-  }
+  if (pluginRequestGate.blocked) return pluginRequestGate.result;
+  body = pluginRequestGate.body;
+
   // Per-API-key device/connection tracking (port of upstream 9router#931,
   // thanks @mugnimaestra). In-memory only, never blocks the request path.
-  if (apiKeyInfo?.id) {
-    trackDevice(
-      apiKeyInfo.id,
-      extractIpFromHeaders(clientRawRequest?.headers ?? null),
-      userAgent ?? null
-    );
-  }
+  trackRequestDevice({ apiKeyId: apiKeyInfo?.id, headers: clientRawRequest?.headers ?? null, userAgent });
   const agentGoalPolicy = resolveAgentGoalPolicy(body, clientRawRequest?.headers ?? null);
   if (agentGoalPolicy.detected) {
     log?.debug?.(
@@ -581,29 +521,18 @@ async function handleChatCoreInner({
   let providerResponse;
   // Failure usage record building extracted to chatCore/failureUsage.ts (#3501); the handler keeps
   // the fire-and-forget save + computes latencyMs, so the call sites stay byte-identical.
-  const persistFailureUsage = (
-    statusCode: number,
-    errorCode?: string | null,
-    aggregate?: FailureUsageAggregate | null
-  ) => {
-    saveRequestUsage(
-      buildFailureUsageRecord({
-        provider,
-        model,
-        connectionId: getCurrentConnectionId(),
-        apiKeyInfo,
-        effectiveServiceTier,
-        isCombo,
-        comboStrategy,
-        statusCode,
-        errorCode,
-        latencyMs: Date.now() - startTime,
-        endpoint: endpointPath,
-        cpaAuthIndex: readCpaAuthIndex(providerResponse),
-        aggregate: aggregate ?? undefined,
-      })
-    ).catch(() => {});
-  };
+  const persistFailureUsage = createPersistFailureUsage({
+    provider,
+    model,
+    getCurrentConnectionId,
+    apiKeyInfo,
+    effectiveServiceTier,
+    isCombo,
+    comboStrategy,
+    endpointPath,
+    startTime,
+    getProviderResponse: () => providerResponse,
+  });
   // Key-health updater extracted to chatCore/keyHealth.ts (#3501); bind the per-request log once
   // and delegate so the existing call sites stay byte-identical.
   const recordKeyHealthStatus = (
@@ -2587,185 +2516,51 @@ async function handleChatCoreInner({
     return result;
   }
 
-  // The latest OmniGlyph release has protocol-native OpenAI transforms. Run
-  // the deferred stage only after translation so Chat/Responses receives the
-  // exact provider wire shape (and so a source→target conversion never embeds
-  // Anthropic image blocks into an OpenAI request, or vice versa).
-  if (runPostTranslationCompression && translatedBody && typeof translatedBody === "object") {
-    const transientFields = new Map<string, unknown>();
-    const postInput = { ...(translatedBody as Record<string, unknown>) };
-    for (const [key, value] of Object.entries(postInput)) {
-      // Translators keep response-side aliases in Maps under private keys. They
-      // are not JSON request fields and would otherwise be stringified to `{}`
-      // by the OmniGlyph library wrapper; restore them after the wire transform.
-      if (key.startsWith("_") && value instanceof Map) {
-        transientFields.set(key, value);
-        delete postInput[key];
-      }
-    }
-    try {
-      const [{ formatCompressionAnnotation }, { trackCompressionStats }] = await Promise.all([
-        import("../services/compression/strategySelector.ts"),
-        import("../services/compression/stats.ts"),
-      ]);
-      const postResult = await runPostTranslationCompression(postInput);
-      if (postResult.compressed) {
-        translatedBody = {
-          ...(postResult.body as typeof translatedBody),
-          ...Object.fromEntries(transientFields),
-        };
-        tokensCompressed += Math.max(
-          0,
-          (postResult.stats?.originalTokens ?? 0) - (postResult.stats?.compressedTokens ?? 0)
-        );
-        if (postResult.stats) {
-          const annotation = formatCompressionAnnotation(postResult.stats);
-          if (annotation) {
-            compressionResponseMeta = compressionResponseMeta
-              ? `${compressionResponseMeta}; ${annotation}`
-              : annotation;
-          }
-          trackCompressionStats(postResult.stats);
-          compressionAnalyticsWritePromise = writeCompressionAnalytics({
-            stats: postResult.stats,
-            provider,
-            effectiveModel,
-            effectiveServiceTier,
-            comboName,
-            mode: postResult.stats.mode,
-            compressionComboId: postResult.stats.compressionComboId ?? null,
-            skillRequestId,
-            cavemanOutputModeApplied: false,
-            cavemanOutputModeIntensity: null,
-            log,
-          });
-          await compressionAnalyticsWritePromise;
-        }
-        log?.info?.(
-          "COMPRESSION",
-          `Post-translation OmniGlyph applied (${sourceFormat} → ${targetFormat})`
-        );
-      }
-    } catch (error) {
-      // Compression is deliberately fail-open. A provider-shaped transform
-      // must never turn an otherwise valid translated request into a 500.
-      log?.warn?.(
-        "COMPRESSION",
-        "Post-translation OmniGlyph skipped: " +
-          (error instanceof Error ? error.message : String(error))
-      );
-    }
-  }
+  ({ translatedBody, tokensCompressed, compressionResponseMeta, compressionAnalyticsWritePromise } =
+    await applyPostTranslationCompression({
+      runPostTranslationCompression,
+      translatedBody,
+      tokensCompressed,
+      compressionResponseMeta,
+      provider,
+      model,
+      connectionId,
+      effectiveModel,
+      effectiveServiceTier,
+      comboName,
+      skillRequestId,
+      sourceFormat,
+      targetFormat,
+      log,
+      trace,
+      writeCompressionAnalytics,
+    }));
 
-  trace("post_translation");
-
-  // Keep the request translator's namespace identities separate from toolNameMap:
-  // the latter is a Kiro/Claude passthrough alias channel with string values,
-  // while namespace identities carry `{namespace, name}` for the #7936 response
-  // seam. Capture both before stripping their side channels: a Responses ->
-  // Gemini/Antigravity pivot carries both maps, not one recoverable ledger.
-  const { requestToolIdentityMap, toolNameAliasMap } = extractRequestToolMetadata(translatedBody);
-
-  // Kiro: sanitize tool schemas before dispatch. Kiro returns 400 "Improperly
-  // formed request" for unsupported JSON-Schema keywords (anyOf/$ref/if-then,
-  // etc.) and tool names >64 chars. Strip those keys and hash-truncate long
-  // names; merge the truncated→original nameMap into the existing
-  // `_toolNameMap` so kiro-to-openai maps streamed tool-call names back (#1375).
-  if (targetFormat === FORMATS.KIRO) {
-    const kiroTools =
-      translatedBody?.conversationState?.currentMessage?.userInputMessage?.userInputMessageContext
-        ?.tools;
-    if (kiroTools) {
-      const { tools: sanitizedKiroTools, nameMap: kiroNameMap } = sanitizeKiroTools(kiroTools);
-      translatedBody.conversationState.currentMessage.userInputMessage.userInputMessageContext.tools =
-        sanitizedKiroTools;
-      if (kiroNameMap.size > 0) {
-        const existing =
-          translatedBody._toolNameMap instanceof Map
-            ? translatedBody._toolNameMap
-            : new Map<string, string>();
-        kiroNameMap.forEach((original, truncated) => existing.set(truncated, original));
-        translatedBody._toolNameMap = existing;
-      }
-    }
-  }
-
-  // Claude: strict Anthropic-compatible gateways (e.g. MiniMax) reject tool
-  // definitions that omit the required `type` discriminator with HTTP 400. Default
-  // a missing `type` to "custom" before dispatch, mirroring Anthropic's own
-  // inference, so legacy Claude-format tool payloads survive strict gateways (#2195).
-  // AgentRouter is the opposite quirk: its Rust deserializer only accepts versioned
-  // tool types and 400s on `type: "custom"` — there the discriminator is stripped
-  // instead (see claudeToolDefaults.ts).
-  if (targetFormat === FORMATS.CLAUDE && Array.isArray(translatedBody.tools)) {
-    translatedBody.tools = normalizeClaudeToolsForDispatch(
-      translatedBody.tools,
-      provider
-    ) as typeof translatedBody.tools;
-  }
-
-  // Extract toolNameMap for response translation (Claude OAuth)
-  const translatedToolNameMap = translatedBody._toolNameMap ?? toolNameAliasMap;
-  const nativeClaudeToolNameMap = isClaudePassthrough
-    ? buildClaudePassthroughToolNameMap(body)
-    : null;
-  // A later provider-specific ledger (Kiro above) wins; otherwise use the
-  // alias map captured before extraction. Namespace identities are distinct
-  // from aliases and cannot restore sanitized Gemini names on their own.
-  const toolNameMap = resolveResponseToolNameMap(
+  ({
+    translatedBody,
+    requestToolIdentityMap,
+    toolNameAliasMap,
     translatedToolNameMap,
     nativeClaudeToolNameMap,
-    requestToolIdentityMap
-  );
-  delete translatedBody._toolNameMap;
-  delete translatedBody._disableToolPrefix;
-
-  // Update model in body — use resolved alias so the provider gets the correct model ID (#472)
-  // Strip provider/alias prefix if it exactly matches the routing prefix so upstream receives the raw model name (#1261)
-  let finalModelToUpstream = effectiveModel;
-  // Defense-in-depth: only string-strip when effectiveModel is actually a string.
-  // The API guards `model` via Zod (z.string()), but internal callers could pass a
-  // non-string and a bare `.startsWith` would crash with `startsWith is not a
-  // function` (same class as #2359 / #2463). Mirrors 9router's `?.startsWith?.()`.
-  if (typeof finalModelToUpstream === "string") {
-    if (finalModelToUpstream.startsWith(`${provider}/`)) {
-      finalModelToUpstream = finalModelToUpstream.slice(provider.length + 1);
-    } else if (alias && finalModelToUpstream.startsWith(`${alias}/`)) {
-      finalModelToUpstream = finalModelToUpstream.slice(alias.length + 1);
-    }
-  }
-  translatedBody.model = finalModelToUpstream;
-
-  const previousResponseIdPolicy = applyResponsesPreviousResponseIdPolicy(translatedBody, {
-    mode: settings.responsesPreviousResponseIdMode,
-    provider,
-    sourceFormat,
+    toolNameMap,
+    finalModelToUpstream,
+  } = await finalizeTranslatedRequest({
+    translatedBody,
     targetFormat,
+    provider,
+    effectiveModel,
+    isClaudePassthrough,
+    clientResponseFormat,
     credentials,
-  });
-  translatedBody = previousResponseIdPolicy.body as typeof translatedBody;
+    body,
+    model,
+    connectionId,
+    settings,
+    alias,
+    sourceFormat,
+  }));
 
-  // #1789: Prevent output_config.effort from overriding effort encoded in model name (Codex)
-  if (provider === "codex" || provider?.startsWith("codex")) {
-    const hasEffortSuffix = finalModelToUpstream.match(/-(low|medium|high|xhigh)$/i);
-    if (
-      hasEffortSuffix &&
-      translatedBody.output_config &&
-      typeof translatedBody.output_config === "object"
-    ) {
-      const oc = translatedBody.output_config as Record<string, unknown>;
-      if (oc.effort) {
-        log?.warn?.(
-          "PARAMS",
-          `Stripped output_config.effort="${oc.effort}" because model "${finalModelToUpstream}" already encodes effort`
-        );
-        delete oc.effort;
-        if (Object.keys(oc).length === 0) {
-          delete translatedBody.output_config;
-        }
-      }
-    }
-  }
+  translatedBody = stripCodexOutputEffort({ provider, finalModelToUpstream, translatedBody, log });
 
   // Strip unsupported parameters for reasoning models (o1, o3, etc.) and any
   // provider that can't accept them at all (e.g. AI Horde's raw completion
@@ -2991,14 +2786,17 @@ async function handleChatCoreInner({
     clientDisconnectGracePeriodMs: STREAM_DISCONNECT_GRACE_PERIOD_MS,
   });
 
-  const dedupRequestBody = { ...translatedBody, model: `${provider}/${model}`, stream };
-  const dedupEnabled = shouldDeduplicate(dedupRequestBody);
   // Namespaced by the calling API key: dedup hands the SAME response object to
   // every joiner, so a shared hash across keys is a cross-principal response
   // leak (GHSA-6c7w-56xp-wpc6).
-  const dedupHash = dedupEnabled
-    ? computeRequestHash(dedupRequestBody, apiKeyInfo?.id, trustedEffortContext)
-    : null;
+  const { dedupEnabled, dedupHash } = runRequestDedup({
+    translatedBody,
+    provider,
+    model,
+    stream,
+    apiKeyId: apiKeyInfo?.id,
+    trustedEffortContext,
+  });
 
   const executeProviderRequestDeps = {
     agentGoalPolicy,
@@ -3150,433 +2948,32 @@ async function handleChatCoreInner({
   let finalBody;
   let claudePromptCacheLogMeta = null;
 
-  let credentialRefreshPersistRan = false;
-  const hadStreamOptions =
-    targetFormat === FORMATS.OPENAI_RESPONSES &&
-    translatedBody &&
-    typeof translatedBody === "object" &&
-    "stream_options" in translatedBody;
-  if (hadStreamOptions) {
-    delete (translatedBody as Record<string, unknown>).stream_options;
-  }
+  const { executeRefreshCredentials, handleCredentialsRefreshed } = await runCredentialRefreshRetry({
+    targetFormat,
+    translatedBody,
+    executor,
+    credentials,
+    provider,
+    resilienceSettings,
+    log,
+    onCredentialsRefreshed,
+    connectionId,
+    getCurrentConnectionId,
+  });
 
-  const executeRefreshCredentials = async (
-    currentCreds: Record<string, unknown>
-  ): Promise<Record<string, unknown> | null> => {
-    if (typeof executor.refreshCredentials !== "function") {
-      return null;
-    }
-    if (hadStreamOptions) {
-      return null;
-    }
-    if (await shouldIsolateProbeFailures()) {
-      return null;
-    }
-
-    const targetCredentials = (currentCreds || credentials || {}) as Record<string, unknown>;
-    const attemptedRefreshToken =
-      typeof targetCredentials?.refreshToken === "string" ? targetCredentials.refreshToken : null;
-    credentialRefreshPersistRan = false;
-    const persistFn = onCredentialsRefreshed
-      ? async (refreshResult: Record<string, unknown>) => {
-          credentialRefreshPersistRan = true;
-          Object.assign(targetCredentials, refreshResult);
-          Object.assign(credentials, refreshResult);
-          await onCredentialsRefreshed(refreshResult);
-        }
-      : undefined;
-
-    const casConnectionId =
-      typeof targetCredentials?.connectionId === "string"
-        ? targetCredentials.connectionId.trim()
-        : "";
-    const casReread = casConnectionId
-      ? async () => {
-          const latest = await getProviderConnectionById(casConnectionId);
-          return typeof latest?.refreshToken === "string" ? latest.refreshToken : null;
-        }
-      : null;
-
-    const newCredentials = (await refreshWithRetry(
-      () =>
-        runWithCasGuard(
-          casReread ? { expectedRefreshToken: attemptedRefreshToken, reread: casReread } : null,
-          () =>
-            runWithOnPersist(persistFn, () => executor.refreshCredentials(targetCredentials, log))
-        ),
-      3,
-      log,
+  const applyProviderFailureClassification = async (failureArgs) =>
+    await applyProviderFailureClassificationLeaf({
+      ...failureArgs,
       provider,
-      {
-        ...(casConnectionId ? { connectionId: casConnectionId } : {}),
-        scope: resilienceSettings.tokenRefreshBreaker.scope,
-        failureThreshold: resilienceSettings.tokenRefreshBreaker.failureThreshold,
-        cooldownMs: resilienceSettings.tokenRefreshBreaker.cooldownMs,
-      }
-    )) as null | Record<string, unknown>;
-
-    if (newCredentials?.accessToken || newCredentials?.copilotToken) {
-      log?.info?.("TOKEN", `${provider?.toUpperCase()} | refreshed`);
-      if (!credentialRefreshPersistRan) {
-        Object.assign(targetCredentials, newCredentials);
-        Object.assign(credentials, newCredentials);
-      }
-      const errorConnectionId = String(getCurrentConnectionId() || connectionId || "");
-      if (errorConnectionId) {
-        updateProviderConnection(errorConnectionId, newCredentials).catch(() => {});
-      }
-      return newCredentials;
-    }
-    return null;
-  };
-
-  const handleCredentialsRefreshed = async (refreshed: Record<string, unknown>) => {
-    Object.assign(credentials, refreshed);
-    if (!credentialRefreshPersistRan && onCredentialsRefreshed) {
-      credentialRefreshPersistRan = true;
-      const targetConnectionId =
-        (credentials as { connectionId?: string })?.connectionId ||
-        (credentials as { id?: string })?.id ||
-        getCurrentConnectionId() ||
-        connectionId;
-      try {
-        await onCredentialsRefreshed({
-          ...refreshed,
-          provider,
-          connectionId: targetConnectionId,
-        });
-      } catch (refreshErr) {
-        log?.warn?.(
-          "REFRESH",
-          `onCredentialsRefreshed persistence callback failed for connection ${targetConnectionId}: ${refreshErr}`
-        );
-      }
-    }
-  };
-
-  const applyProviderFailureClassification = async ({
-    statusCode,
-    message,
-    headers,
-    upstreamErrorBody,
-    retryAfterMs,
-    targetModel,
-  }: {
-    statusCode: number;
-    message: string;
-    headers?: Headers | null;
-    upstreamErrorBody?: unknown;
-    retryAfterMs?: number | null;
-    targetModel: string;
-  }) => {
-    let errorType = classifyProviderError(statusCode, message, provider);
-    if (statusCode === 429 && isModelScope()) {
-      const decision = classifyModelScope429(message, normalizeHeaders(headers));
-      errorType =
-        decision.kind === "quota_exhausted"
-          ? PROVIDER_ERROR_TYPES.QUOTA_EXHAUSTED
-          : PROVIDER_ERROR_TYPES.RATE_LIMITED;
-      log?.warn?.(
-        "MODELSCOPE_429",
-        `${decision.kind} (model remaining: ${decision.snapshot.modelRemaining ?? "unknown"}, total remaining: ${decision.snapshot.totalRemaining ?? "unknown"})`
-      );
-    }
-    const persistentMessage = projectRetainedProviderFailureMessage(message, videoBridgeObserved);
-    const errorConnectionId = getCurrentConnectionId() || connectionId;
-    if (errorConnectionId && errorType) {
-      try {
-        if (errorType === PROVIDER_ERROR_TYPES.FORBIDDEN) {
-          const probeIsolated = await shouldIsolateProbeFailures();
-          await writeTerminalStatus(
-            errorConnectionId,
-            {
-              testStatus: "banned",
-              isActive: false,
-              lastError: persistentMessage,
-              lastErrorType: errorType,
-              errorCode: String(statusCode),
-            },
-            probeIsolated ? "probe" : "production"
-          );
-          if (probeIsolated) {
-            console.warn(
-              `[provider] Node ${errorConnectionId} probe ${errorType} (${statusCode}) -- connection stays active`
-            );
-          } else {
-            console.warn(
-              `[provider] Node ${errorConnectionId} banned (${statusCode}) -- disabling permanently`
-            );
-          }
-        } else if (errorType === PROVIDER_ERROR_TYPES.ACCOUNT_DEACTIVATED) {
-          if (
-            connectionHasExtraKeys(
-              errorConnectionId,
-              (credentials?.providerSpecificData as Record<string, unknown> | undefined)
-                ?.extraApiKeys as string[] | undefined
-            )
-          ) {
-            await updateProviderConnection(errorConnectionId, {
-              lastErrorType: errorType,
-              lastError: persistentMessage,
-              errorCode: statusCode,
-            });
-            console.warn(
-              `[provider] Node ${errorConnectionId} account deactivated (${statusCode}) -- has extra keys, keeping connection active`
-            );
-          } else {
-            const probeIsolated2 = await shouldIsolateProbeFailures();
-            await writeTerminalStatus(
-              errorConnectionId,
-              {
-                testStatus: "deactivated",
-                isActive: false,
-                lastError: persistentMessage,
-                lastErrorType: errorType,
-                errorCode: String(statusCode),
-              },
-              probeIsolated2 ? "probe" : "production"
-            );
-            if (probeIsolated2) {
-              console.warn(
-                `[provider] Node ${errorConnectionId} probe ${errorType} (${statusCode}) -- connection stays active`
-              );
-            } else {
-              console.warn(
-                `[provider] Node ${errorConnectionId} account deactivated (${statusCode}) -- disabling permanently`
-              );
-            }
-          }
-        } else if (errorType === PROVIDER_ERROR_TYPES.QUOTA_EXHAUSTED) {
-          const probeIsolated3 = await shouldIsolateProbeFailures();
-          if (probeIsolated3) {
-            await writeTerminalStatus(
-              errorConnectionId,
-              {
-                testStatus: "credits_exhausted",
-                lastError: persistentMessage,
-                lastErrorType: errorType,
-                errorCode: String(statusCode),
-              },
-              "probe"
-            );
-            console.warn(
-              `[provider] Node ${errorConnectionId} probe ${errorType} (${statusCode}) -- connection stays active`
-            );
-          } else {
-            let kimiRateLimitResetAt: string | null = null;
-            if (provider === "kimi-coding") {
-              try {
-                const { fetchAndPersistProviderLimits } =
-                  await import("@/lib/usage/providerLimits");
-                const { usage } = await fetchAndPersistProviderLimits(errorConnectionId, "manual");
-                kimiRateLimitResetAt = getKimiTemporaryRateLimitResetAt(usage);
-              } catch {}
-            }
-
-            let quotaCooldownMs = kimiRateLimitResetAt
-              ? Math.max(new Date(kimiRateLimitResetAt).getTime() - Date.now(), 0)
-              : retryAfterMs || COOLDOWN_MS.rateLimit;
-            const deferAntigravityQuotaStateToCaller = shouldDeferAntigravityQuotaStateToCaller(
-              provider,
-              typeof onStreamFailure === "function"
-            );
-            const isAntigravityQuotaFamily = shouldDeferAntigravityQuotaStateToCaller(
-              provider,
-              true
-            );
-            let coreOwnedAntigravityLockout: {
-              cooldownMs: number;
-              failureCount: number;
-            } | null = null;
-            if (isAntigravityQuotaFamily && !deferAntigravityQuotaStateToCaller) {
-              const quotaErrorText =
-                typeof upstreamErrorBody === "string"
-                  ? upstreamErrorBody
-                  : upstreamErrorBody == null
-                    ? message
-                    : JSON.stringify(upstreamErrorBody);
-              coreOwnedAntigravityLockout = await recordCoreOwnedAntigravityQuotaState({
-                provider,
-                connectionId: errorConnectionId,
-                model,
-                status: statusCode,
-                errorText: quotaErrorText,
-                headers: headers ?? undefined,
-              });
-              quotaCooldownMs = coreOwnedAntigravityLockout.cooldownMs;
-            }
-            const accountSemaphoreKey = resolveAccountSemaphoreKey({
-              provider,
-              model: targetModel,
-              connectionId: errorConnectionId,
-              credentials,
-            });
-            if (accountSemaphoreKey && !deferAntigravityQuotaStateToCaller) {
-              markAccountSemaphoreBlocked(accountSemaphoreKey, quotaCooldownMs);
-            }
-            if (deferAntigravityQuotaStateToCaller) {
-            } else if (coreOwnedAntigravityLockout) {
-              console.warn(
-                `[provider] Node ${errorConnectionId} Antigravity model quota exhausted (${statusCode}) for ${model} - ${Math.ceil(coreOwnedAntigravityLockout.cooldownMs / 1000)}s (failureCount=${coreOwnedAntigravityLockout.failureCount}, owner=core)`
-              );
-            } else if (kimiRateLimitResetAt) {
-              await updateProviderConnection(errorConnectionId, {
-                testStatus: "unavailable",
-                rateLimitedUntil: kimiRateLimitResetAt,
-                backoffLevel: 0,
-                lastErrorType: PROVIDER_ERROR_TYPES.RATE_LIMITED,
-                lastError: persistentMessage,
-                errorCode: statusCode,
-              });
-              console.warn(
-                `[provider] Node ${errorConnectionId} Kimi request window exhausted (${statusCode}) -- retrying after ${kimiRateLimitResetAt}`
-              );
-            } else if (isModelScope() && errorConnectionId) {
-              lockModel(provider, errorConnectionId, model, "quota_exhausted", quotaCooldownMs);
-              if (targetModel && targetModel !== model) {
-                lockModel(
-                  provider,
-                  errorConnectionId,
-                  targetModel,
-                  "quota_exhausted",
-                  quotaCooldownMs
-                );
-              }
-              console.warn(
-                `[provider] Node ${errorConnectionId} ModelScope model quota exhausted (${statusCode}) for ${targetModel} - ${Math.ceil(quotaCooldownMs / 1000)}s (connection stays active)`
-              );
-            } else if (
-              lockModelIfPerModelQuota(
-                provider,
-                errorConnectionId,
-                model,
-                "quota_exhausted",
-                quotaCooldownMs
-              ) ||
-              (targetModel &&
-                targetModel !== model &&
-                lockModelIfPerModelQuota(
-                  provider,
-                  errorConnectionId,
-                  targetModel,
-                  "quota_exhausted",
-                  quotaCooldownMs
-                ))
-            ) {
-              const quotaScope = getQuotaScopeLabelForProvider(provider, targetModel);
-              console.warn(
-                `[provider] Node ${errorConnectionId} ${quotaScope}-only quota exhausted (${statusCode}) for ${targetModel} - ${Math.ceil(quotaCooldownMs / 1000)}s (cooldown_scope=${quotaScope}, ttl_source=${retryAfterMs ? "upstream" : "inferred"}, connection stays active)`
-              );
-            } else {
-              await writeTerminalStatus(
-                errorConnectionId,
-                {
-                  testStatus: "credits_exhausted",
-                  lastError: persistentMessage,
-                  lastErrorType: errorType,
-                  errorCode: String(statusCode),
-                },
-                "production"
-              );
-              console.warn(`[provider] Node ${errorConnectionId} exhausted quota (${statusCode})`);
-            }
-          }
-        } else if (errorType === PROVIDER_ERROR_TYPES.UNAUTHORIZED) {
-          await updateProviderConnection(errorConnectionId, {
-            lastErrorType: errorType,
-            lastError: persistentMessage,
-            errorCode: statusCode,
-          });
-        } else if (errorType === PROVIDER_ERROR_TYPES.OAUTH_INVALID_TOKEN) {
-          await updateProviderConnection(errorConnectionId, {
-            lastErrorType: errorType,
-            lastError: persistentMessage,
-            errorCode: statusCode,
-          });
-          console.warn(
-            `[provider] Node ${errorConnectionId} OAuth token invalid (${statusCode}) -- token refresh available`
-          );
-        } else if (errorType === PROVIDER_ERROR_TYPES.PROJECT_ROUTE_ERROR) {
-          await updateProviderConnection(errorConnectionId, {
-            lastErrorType: errorType,
-            lastError: persistentMessage,
-            errorCode: statusCode,
-          });
-          console.warn(
-            `[provider] Node ${errorConnectionId} project routing error (${statusCode}) -- not banning`
-          );
-          // #14313: free-tier refusal on the keyless path — record a short TTL
-          // skip so auto-combo / noauth fallback stop re-picking it immediately.
-          if (
-            errorConnectionId === "noauth" &&
-            isOpencodeFreeTierRefusalForProvider(provider, statusCode, message)
-          ) {
-            noteOpencodeFreeTierSkip(provider, Date.now(), undefined, targetModel);
-          }
-        } else if (errorType === PROVIDER_ERROR_TYPES.GEO_BLOCKED) {
-          // Google regional refusal: account-independent, non-terminal; park the connection
-          // until egress uses a supported region; probes skip the day-long cooldown (#9817).
-          await excludeConnectionForCooldown({
-            connectionId: errorConnectionId,
-            errorType,
-            message: persistentMessage,
-            statusCode,
-            cooldownMs: COOLDOWN_MS.geoBlocked ?? 24 * 60 * 60 * 1000,
-            skipCooldownForProbe: true,
-            label: "geo-blocked",
-            suffix: "trying other accounts",
-          });
-        } else if (errorType === PROVIDER_ERROR_TYPES.REQUEST_REJECTED) {
-          // Per-request refusal (#12859): growing cooldown, streak → banned.
-          await handleRequestRejectedFailure({
-            connectionId: errorConnectionId,
-            statusCode,
-            message: persistentMessage,
-          });
-        } else if (errorType === PROVIDER_ERROR_TYPES.GCP_PROJECT_REQUIRED) {
-          // Antigravity BYOP: fixable via a Project ID; never a lockout/ban. Park the connection.
-          await excludeConnectionForCooldown({
-            connectionId: errorConnectionId,
-            errorType,
-            message: persistentMessage,
-            statusCode,
-            cooldownMs: COOLDOWN_MS.gcpProjectRequired ?? 24 * 60 * 60 * 1000,
-            skipCooldownForProbe: false,
-            label: "GCP project required",
-            suffix: "routing to other accounts (enter a Project ID to restore)",
-          });
-        } else if (errorType === PROVIDER_ERROR_TYPES.MODEL_NOT_FOUND) {
-          const notFoundCooldownMs = COOLDOWN_MS.notFound;
-          if (!(await shouldIsolateProbeFailures())) {
-            const modelToLock = targetModel || model;
-            lockModel(
-              provider,
-              errorConnectionId,
-              modelToLock,
-              "model_not_found",
-              notFoundCooldownMs
-            );
-            console.warn(
-              `[provider] Node ${errorConnectionId} model not found (${statusCode}) for ${modelToLock} - locking model for ${Math.ceil(notFoundCooldownMs / 1000)}s (connection stays active)`
-            );
-          }
-        }
-      } catch {}
-    }
-
-    if (headers) {
-      updateFromHeaders(provider, errorConnectionId, headers, statusCode, targetModel);
-    }
-    if (errorConnectionId && upstreamErrorBody !== null && upstreamErrorBody !== undefined) {
-      updateFromResponseBody(
-        provider,
-        errorConnectionId,
-        upstreamErrorBody,
-        statusCode,
-        targetModel
-      );
-    }
-  };
+      model,
+      connectionId,
+      credentials,
+      videoBridgeObserved,
+      getCurrentConnectionId,
+      isModelScope,
+      onStreamFailure,
+      log,
+    });
 
   let pipelineRecovered = false;
   if (stream) {
