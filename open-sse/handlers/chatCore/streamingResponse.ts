@@ -85,6 +85,10 @@ import { trackPendingRequest, appendRequestLog } from "@/lib/usageDb";
 import { updatePendingScope } from "@/lib/usage/pendingRequestScope";
 
 import { normalizeExecutorResult } from "./upstreamTimeouts.ts";
+import {
+  isAntigravityProvider,
+  toAntigravityDiagnosticPayload,
+} from "../../executors/antigravityUpstreamError.ts";
 
 import { getProviderCredentials, extractSessionAffinityKey } from "@/sse/services/auth";
 
@@ -204,6 +208,10 @@ export async function runStreamingResponse(deps: StreamingDeps) {
   providerResponse = deps.providerResponse;
   providerUrl = deps.providerUrl;
   translatedBody = deps.translatedBody;
+  // #3229: always describes whichever response `providerResponse` currently holds — every
+  // retry, recovery, or fallback that replaces the response replaces or clears this too, or
+  // the log attributes one attempt's diagnosis to a different attempt's response.
+  let upstreamDiagnostic: Record<string, unknown> | undefined;
   try {
     const pipelineOutcome = await runProviderExecutionPipeline({
       policy: {
@@ -306,6 +314,7 @@ export async function runStreamingResponse(deps: StreamingDeps) {
 
     pipelineRecovered = true;
     currentModel = pipelineOutcome.model;
+    upstreamDiagnostic = pipelineOutcome.upstreamDiagnostic;
     if (pipelineOutcome.kind === "error") {
       providerResponse = pipelineOutcome.result.response;
       providerUrl = "";
@@ -714,6 +723,7 @@ export async function runStreamingResponse(deps: StreamingDeps) {
           )
         );
 
+        upstreamDiagnostic = retryResult.upstreamDiagnostic;
         if (retryResult.response.ok) {
           providerResponse = retryResult.response;
           providerUrl = retryResult.url;
@@ -848,6 +858,7 @@ export async function runStreamingResponse(deps: StreamingDeps) {
         });
     if (!pipelineRecovered && signatureRecovery.attempted && signatureRecovery.execution) {
       providerResponse = signatureRecovery.execution.response;
+      upstreamDiagnostic = signatureRecovery.execution.upstreamDiagnostic;
       if (signatureRecovery.succeeded) {
         providerUrl = signatureRecovery.execution.url;
         providerHeaders = signatureRecovery.execution.headers;
@@ -900,6 +911,7 @@ export async function runStreamingResponse(deps: StreamingDeps) {
         ),
         requestId: skillRequestId,
       });
+      upstreamDiagnostic = undefined;
       log?.warn?.(
         "PROBE",
         `Reasoning probe (max_tokens < ${REASONING_BUFFER_MIN_TRIGGER}) answered with truncated 200 — upstream reported "${message}"`
@@ -935,14 +947,34 @@ export async function runStreamingResponse(deps: StreamingDeps) {
       log?.debug?.("RETRY", `Antigravity quota reset in ${retrySeconds}s (${retryAfterMs}ms)`);
     }
 
+    // #3229: Antigravity terminal failures are diagnosed from the bounded projection, never
+    // from the upstream payload — see isAntigravityProvider in antigravityUpstreamError.ts.
+    const isAgyProvider = isAntigravityProvider(provider);
+    const agyDiagnostic = toAntigravityDiagnosticPayload(upstreamDiagnostic);
+    const persistedProviderErrorBody = isAgyProvider ? agyDiagnostic : safeUpstreamErrorBody;
+    // A successful intra-family fallback replaces the response the diagnostic above
+    // describes, so re-point the log at the one it now describes (a 2xx carries none).
+    // The streaming path has no success-side logProviderResponse to overwrite it, so
+    // without this the failed attempt's diagnosis would outlive the request it failed.
+    const adoptFallbackDiagnostic = (fallbackDiagnostic?: Record<string, unknown>) => {
+      upstreamDiagnostic = fallbackDiagnostic;
+      if (isAgyProvider) {
+        reqLogger.logProviderDiagnostic(toAntigravityDiagnosticPayload(upstreamDiagnostic));
+      }
+    };
+
     // Log error with full request body for debugging
     reqLogger.logError(new Error(message), finalBody || translatedBody);
-    reqLogger.logProviderResponse(
-      providerResponse.status,
-      providerResponse.statusText,
-      providerResponse.headers,
-      safeUpstreamErrorBody
-    );
+    if (isAgyProvider) {
+      reqLogger.logProviderDiagnostic(agyDiagnostic);
+    } else {
+      reqLogger.logProviderResponse(
+        providerResponse.status,
+        providerResponse.statusText,
+        providerResponse.headers,
+        safeUpstreamErrorBody
+      );
+    }
 
     // Rate limiter updated in applyProviderFailureClassification
 
@@ -962,6 +994,7 @@ export async function runStreamingResponse(deps: StreamingDeps) {
           const fallbackResult = await executeProviderRequest(nextModel, false);
           if (fallbackResult.response.ok) {
             providerResponse = fallbackResult.response;
+            adoptFallbackDiagnostic(fallbackResult.upstreamDiagnostic);
             providerUrl = fallbackResult.url;
             providerHeaders = fallbackResult.headers;
             finalBody = providerRequestCapture.body(fallbackResult.transformedBody);
@@ -981,7 +1014,7 @@ export async function runStreamingResponse(deps: StreamingDeps) {
               status: statusCode,
               error: safeErrMsg,
               providerRequest: finalBody || translatedBody,
-              providerResponse: safeUpstreamErrorBody,
+              providerResponse: persistedProviderErrorBody,
               clientResponse: buildErrorBody(statusCode, errMsg),
               cacheSource: "upstream",
             });
@@ -1013,7 +1046,7 @@ export async function runStreamingResponse(deps: StreamingDeps) {
             status: statusCode,
             error: safeErrMsg,
             providerRequest: finalBody || translatedBody,
-            providerResponse: safeUpstreamErrorBody,
+            providerResponse: persistedProviderErrorBody,
             clientResponse: buildErrorBody(statusCode, errMsg),
             cacheSource: "upstream",
           });
@@ -1045,7 +1078,7 @@ export async function runStreamingResponse(deps: StreamingDeps) {
           status: statusCode,
           error: safeErrMsg,
           providerRequest: finalBody || translatedBody,
-          providerResponse: safeUpstreamErrorBody,
+          providerResponse: persistedProviderErrorBody,
           clientResponse: buildErrorBody(statusCode, errMsg),
           cacheSource: "upstream",
         });
@@ -1088,6 +1121,7 @@ export async function runStreamingResponse(deps: StreamingDeps) {
           const fallbackResult = await executeProviderRequest(nextModel, false);
           if (fallbackResult.response.ok) {
             providerResponse = fallbackResult.response;
+            adoptFallbackDiagnostic(fallbackResult.upstreamDiagnostic);
             providerUrl = fallbackResult.url;
             providerHeaders = fallbackResult.headers;
             finalBody = providerRequestCapture.body(fallbackResult.transformedBody);
@@ -1106,7 +1140,7 @@ export async function runStreamingResponse(deps: StreamingDeps) {
               status: statusCode,
               error: safeErrMsg,
               providerRequest: finalBody || translatedBody,
-              providerResponse: safeUpstreamErrorBody,
+              providerResponse: persistedProviderErrorBody,
               clientResponse: buildErrorBody(statusCode, errMsg),
               cacheSource: "upstream",
             });
@@ -1138,7 +1172,7 @@ export async function runStreamingResponse(deps: StreamingDeps) {
             status: statusCode,
             error: safeErrMsg,
             providerRequest: finalBody || translatedBody,
-            providerResponse: safeUpstreamErrorBody,
+            providerResponse: persistedProviderErrorBody,
             clientResponse: buildErrorBody(statusCode, errMsg),
             cacheSource: "upstream",
           });
@@ -1170,7 +1204,7 @@ export async function runStreamingResponse(deps: StreamingDeps) {
           status: statusCode,
           error: safeErrMsg,
           providerRequest: finalBody || translatedBody,
-          providerResponse: safeUpstreamErrorBody,
+          providerResponse: persistedProviderErrorBody,
           clientResponse: buildErrorBody(statusCode, errMsg),
           cacheSource: "upstream",
         });
@@ -1202,7 +1236,7 @@ export async function runStreamingResponse(deps: StreamingDeps) {
         status: statusCode,
         error: safeErrMsg,
         providerRequest: finalBody || translatedBody,
-        providerResponse: safeUpstreamErrorBody,
+        providerResponse: persistedProviderErrorBody,
         clientResponse: buildErrorBody(statusCode, errMsg),
         cacheSource: "upstream",
       });

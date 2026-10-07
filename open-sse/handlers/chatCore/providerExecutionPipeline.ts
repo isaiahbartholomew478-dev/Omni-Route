@@ -24,6 +24,7 @@ export interface ChatCoreExecutorResult {
   headers: Record<string, string>;
   transformedBody: unknown;
   transport?: string;
+  upstreamDiagnostic?: Record<string, unknown>;
   _executionCredentials?: Record<string, unknown>;
   _accountSemaphoreRelease?: () => void;
 }
@@ -41,6 +42,7 @@ export type ProviderExecutionOutcome =
       url: string;
       headers: Record<string, string>;
       transformedBody: unknown;
+      upstreamDiagnostic?: Record<string, unknown>;
       model: string;
       connectionId: string;
     }
@@ -48,6 +50,7 @@ export type ProviderExecutionOutcome =
       kind: "error";
       result: ChatCoreErrorResult;
       providerUsage: ProviderLegUsage | null;
+      upstreamDiagnostic?: Record<string, unknown>;
       model: string;
       connectionId: string;
     };
@@ -231,6 +234,7 @@ async function toOutcome(
       url: attempt.url,
       headers: attempt.headers,
       transformedBody: attempt.transformedBody,
+      upstreamDiagnostic: attempt.upstreamDiagnostic,
       model,
       connectionId,
     };
@@ -285,6 +289,7 @@ async function toOutcome(
       upstreamHeaders: attempt.response.headers,
     },
     providerUsage: null,
+    upstreamDiagnostic: attempt.upstreamDiagnostic,
     model,
     connectionId,
   };
@@ -504,6 +509,7 @@ export async function runProviderExecutionPipeline(
           headers:
             (signatureRecovery.execution.headers as Record<string, string>) ?? attempt.headers,
           transformedBody: signatureRecovery.execution.transformedBody ?? attempt.transformedBody,
+          upstreamDiagnostic: signatureRecovery.execution.upstreamDiagnostic,
         };
         return toOutcome(
           lastAttempt,
