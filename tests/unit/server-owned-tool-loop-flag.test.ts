@@ -73,8 +73,9 @@ describe("feature-flags-settings count update", () => {
     // default off) to 77; STREAM_READINESS_STALL_RETRY (#14669, default off) to 78;
     // OPENCODE_POOL_RESELECT (default off) to 79; PROXY_POOL_SHARED_EGRESS_ORDER
     // (#14657, default off) to 80; PROXY_OPERATOR_EGRESS_ENABLED (#15314,
-    // default off) to 81.
-    assert.equal(FEATURE_FLAG_DEFINITIONS.length, 81);
+    // default off) to 81. Tip live catalog is 82; REASONING_REPLAY_ENABLED
+    // adds the unique flag → 83.
+    assert.equal(FEATURE_FLAG_DEFINITIONS.length, 83);
   });
 });
 

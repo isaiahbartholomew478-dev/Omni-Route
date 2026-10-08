@@ -52,7 +52,9 @@ const {
 // takes it to 80.
 // PROXY_OPERATOR_EGRESS_ENABLED (operator-pushed dated observed addresses per
 // pool member, default off) takes it to 81.
-const EXPECTED_FEATURE_FLAG_COUNT = 81;
+// Tip catalog is 82 live definitions (snapshot on origin/release/v3.8.52
+// still reads 81). REASONING_REPLAY_ENABLED adds the unique flag → 83.
+const EXPECTED_FEATURE_FLAG_COUNT = 83;
 
 // ──────────────────────────────────────────────────────
 // Test group 1 — Flag definitions registry
