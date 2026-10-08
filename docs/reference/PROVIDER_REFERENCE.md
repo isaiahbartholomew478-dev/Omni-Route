@@ -1,16 +1,16 @@
 ---
 title: "Provider Reference"
 version: 3.8.52
-lastUpdated: 2026-10-04
+lastUpdated: 2026-10-08
 ---
 
 # Provider Reference
 
 > **Auto-generated** from `src/shared/constants/providers.ts` — do not edit by hand.
 > Regenerate with: `npm run gen:provider-reference`
-> **Last generated:** 2026-10-04
+> **Last generated:** 2026-10-08
 
-Total providers: **358**. See category breakdown below.
+Total providers: **360**. See category breakdown below.
 
 ## Categories
 
@@ -49,7 +49,7 @@ Use the dashboard at `/dashboard/providers` to enable, configure, and test each 
 | `veoaifree-web` | `veo-free` | Veo AI Free | No-auth, video | [link](https://veoaifree.com) | No auth required. Rate limited to 6 requests/hour per IP. | — |
 | `zcode` | `zc` | ZCode (GLM Coding Plan) | No-auth | [link](https://zcode.z.ai) | No API key stored by OmniRoute. The local ZCode app-server uses the existing builtin:zai-coding-plan login. | — |
 
-## OAuth Providers (25)
+## OAuth Providers (26)
 
 | ID | Alias | Name | Tags | Website | Notes |
 |----|-------|------|------|---------|-------|
@@ -75,6 +75,7 @@ Use the dashboard at `/dashboard/providers` to enable, configure, and test each 
 | `openference` | `of` | Openference | OAuth | [link](https://openference.com) | Sign in with your Openference account to route requests through api.openference.com. Includes free-tier access to Qwen3.8 27b and Llama 3.2 3B — see openference.com/pricing for current plan terms. |
 | `qoder` | `if` | Qoder | OAuth | — | — |
 | `trae` | `tr` | Trae | OAuth | [link](https://trae.ai) | Trae is an AI-native IDE by ByteDance (SOLO remote agent). Authorize via trae.ai in the popup, or sign in at solo.trae.ai and paste the Cloud-IDE-JWT (sent as 'Authorization: Cloud-IDE-JWT <token>', ~14-day lifetime) as the access token; web_id/biz_user_id/user_unique_id/scope/tenant/region propagate via providerSpecificData. No headless refresh for pasted tokens — re-paste on expiry. |
+| `workbuddy` | `wb` | WorkBuddy | OAuth | [link](https://www.workbuddy.ai) | Tencent WorkBuddy (www.workbuddy.ai). Authorize the CLI device flow in the popup; OmniRoute then polls for the token and attaches the required X-Product: SaaS header. The model roster is served by the authenticated catalogue, so it is discovered live rather than listed here. WorkBuddy only accepts streaming requests, which OmniRoute accumulates back into a JSON response for non-streaming callers. |
 | `xai-oauth` | `xao` | xAI OAuth (Grok) | OAuth | [link](https://x.ai) | Sign in with xAI to use api.x.ai models such as Grok 4.5. This is separate from Grok Build JWT sessions, which use cli-chat-proxy.grok.com and grok-build model aliases. |
 | `zed` | `zd` | Zed IDE | OAuth | [link](https://zed.dev) | Zed stores LLM provider credentials (OpenAI, Anthropic, Google, Mistral, xAI) in the OS keychain. Use the Import button below to discover and import them automatically. |
 | `zed-hosted` | — | Zed Hosted Models | OAuth | [link](https://zed.dev) | Sign in with your Zed account (native-app sign-in). OmniRoute generates a one-time RSA keypair and opens zed.dev to authorize it — on a remote/headless install, copy the resulting 127.0.0.1 callback URL from your browser's address bar and paste it back here. Distinct from the 'Zed IDE' credential-import entry above: this proxies chat completions through Zed's own hosted model aggregator (cloud.zed.dev), fronting Anthropic/OpenAI/Google/xAI models under your Zed plan. |
@@ -117,7 +118,7 @@ Use the dashboard at `/dashboard/providers` to enable, configure, and test each 
 | `zai-web` | `zw` | Z.ai Web | Web cookie | [link](https://chat.z.ai) | Copy the "token" value from chat.z.ai → DevTools → Application → Local Storage. Do not copy cookies; OmniRoute handles the per-request CAPTCHA through its browser transport. | — |
 | `zenmux-free` | `zmf` | ZenMux Free (Web) | Web cookie | [link](https://zenmux.ai) | Login at zenmux.ai, then export all cookies using EditThisCookie or Cookie-Editor and paste the full Cookie header string here. Refresh every ~30 days. | — |
 
-## API Key Providers (paid / paid-with-free-credits) (241)
+## API Key Providers (paid / paid-with-free-credits) (242)
 
 | ID | Alias | Name | Tags | Website | Notes |
 |----|-------|------|------|---------|-------|
@@ -356,6 +357,7 @@ Use the dashboard at `/dashboard/providers` to enable, configure, and test each 
 | `xiaomi-mimo` | `mimo` | Xiaomi MiMo | API key | [link](https://mimo.mi.com) | — |
 | `xiaomi-mimo-token-plan` | `mimotp` | Xiaomi MiMo Token Plan | API key | [link](https://mimo.mi.com) | — |
 | `xkiro` | `xkiro` | xKiro | API key, aggregator | [link](https://xkiro.com) | Create a free account at xkiro.com and paste the key here (Bearer; x-api-key also accepted). |
+| `y-api` | `y-api` | Y-API | API key, aggregator | [link](https://y-api.bestvirtualgoods.com) | 4 of its 20 catalog models (deepseek/deepseek-v4-flash, minimax/minimax-m2.7, tencent/hy3, xiaomi/mimo-v2.5) are priced at 0 credit in the publisher's 2026-10-04 snapshot; the rest bill against prepaid credit, and signup grants a small credit whose amount is Y-API's to set. Y-API can withdraw a free model at any time — re-check https://y-api.bestvirtualgoods.com/pricing.json. |
 | `yi` | `yi` | Yi (01.AI) | API key | [link](https://01.ai) | Get API key at platform.lingyiwanwu.com |
 | `yolo-auto` | `yolo-auto` | Yolo-Auto | API key, aggregator | [link](https://yolo-auto.com) | Free API access is request-limited and intended for testing; no numeric daily quota is published and free access is not promised indefinitely. |
 | `zai` | `zai` | Z.AI | API key | [link](https://open.bigmodel.cn) | — |
@@ -446,7 +448,7 @@ Use the dashboard at `/dashboard/providers` to enable, configure, and test each 
 
 - Catalog: [`src/shared/constants/providers.ts`](../../src/shared/constants/providers.ts)
 - Registry (per-model details): [`open-sse/config/providerRegistry.ts`](../../open-sse/config/providerRegistry.ts)
-- Executors: [`open-sse/executors/`](../../open-sse/executors/) (136 implementations)
+- Executors: [`open-sse/executors/`](../../open-sse/executors/) (138 implementations)
 - Translators: [`open-sse/translator/`](../../open-sse/translator/)
 
 ## See Also
