@@ -5,44 +5,6 @@
 // explicit add/remove delta in its own file (currently both deltas are empty).
 
 export const ANTIGRAVITY_SHARED_MODELS = Object.freeze([
-  // Gemini 3.7 Flash tiers. The live endpoint selects High by default and advertises
-  // all three ids to both the IDE 2.5.5 and CLI 1.1.x clients.
-  {
-    id: "gemini-3.7-flash-high",
-    name: "Gemini 3.7 Flash (High)",
-    contextLength: 1048576,
-    maxOutputTokens: 65536,
-    supportsReasoning: true,
-    supportsVision: true,
-    toolCalling: true,
-  },
-  {
-    id: "gemini-3.7-flash-medium",
-    name: "Gemini 3.7 Flash (Medium)",
-    contextLength: 1048576,
-    maxOutputTokens: 65536,
-    supportsReasoning: true,
-    supportsVision: true,
-    toolCalling: true,
-  },
-  {
-    id: "gemini-3.7-flash-low",
-    name: "Gemini 3.7 Flash (Low)",
-    contextLength: 1048576,
-    maxOutputTokens: 65536,
-    supportsReasoning: true,
-    supportsVision: true,
-    toolCalling: true,
-  },
-  {
-    id: "gemini-3.7-flash-tiered",
-    name: "Gemini 3.7 Flash (Tiered)",
-    contextLength: 1048576,
-    maxOutputTokens: 65536,
-    supportsReasoning: true,
-    supportsVision: true,
-    toolCalling: true,
-  },
   // Gemini 3.8 Flash tiers. Served directly at these ids by the live upstream — no
   // shared "-tiered" endpoint exists for 3.8 (unlike 3.7).
   {
@@ -66,6 +28,17 @@ export const ANTIGRAVITY_SHARED_MODELS = Object.freeze([
   {
     id: "gemini-3.8-flash-low",
     name: "Gemini 3.8 Flash (Low)",
+    contextLength: 1048576,
+    maxOutputTokens: 65536,
+    supportsReasoning: true,
+    supportsVision: true,
+    toolCalling: true,
+  },
+  // Gemini 3.7 Flash shared tier. Still served live (discussion #15568 roster); the per-tier
+  // 3.7 display ids alias onto it (ANTIGRAVITY_MODEL_ALIASES), so only this id is public.
+  {
+    id: "gemini-3.7-flash-tiered",
+    name: "Gemini 3.7 Flash (Tiered)",
     contextLength: 1048576,
     maxOutputTokens: 65536,
     supportsReasoning: true,
