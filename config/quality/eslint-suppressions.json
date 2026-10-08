@@ -556,14 +556,6 @@
       "count": 3
     }
   },
-  "open-sse/services/usage/codebuddy-cn.ts": {
-    "@typescript-eslint/no-explicit-any": {
-      "count": 2
-    },
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
   "open-sse/services/usage/github.ts": {
     "@typescript-eslint/no-unused-vars": {
       "count": 1
@@ -1486,11 +1478,6 @@
     }
   },
   "src/lib/oauth/providers/cline.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
-  "src/lib/oauth/providers/codebuddy-cn.ts": {
     "@typescript-eslint/no-unused-vars": {
       "count": 1
     }
