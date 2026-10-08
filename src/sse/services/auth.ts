@@ -2704,6 +2704,9 @@ export async function markAccountUnavailable(
     headers?: Headers | Record<string, string> | null;
     correlationId?: string | null;
     streamOutputEmitted?: boolean;
+    isAvalancheRisk?: boolean;
+    avalancheCooldownMs?: number;
+    suppressFallback?: boolean;
   } = {}
 ) {
   const currentMutex = markMutexes.get(connectionId) || Promise.resolve();
@@ -3138,12 +3141,18 @@ export async function markAccountUnavailable(
         effectiveProviderProfile,
         {
           ...modelLockoutOptions,
-          exactCooldownMs: isModelScopedClaudeQuota
-            ? claudeQuotaScope.cooldownMs
-            : fallbackResult.usedUpstreamRetryHint === true
-              ? fallbackResult.cooldownMs
-              : (fallbackResult.quotaResetHintMs ?? null),
-          maxCooldownMs: mlSettings.maxCooldownMs,
+          exactCooldownMs:
+            options.isAvalancheRisk && typeof options.avalancheCooldownMs === "number"
+              ? options.avalancheCooldownMs
+              : isModelScopedClaudeQuota
+                ? claudeQuotaScope.cooldownMs
+                : fallbackResult.usedUpstreamRetryHint === true
+                  ? fallbackResult.cooldownMs
+                  : (fallbackResult.quotaResetHintMs ?? null),
+          maxCooldownMs:
+            options.isAvalancheRisk && typeof options.avalancheCooldownMs === "number"
+              ? options.avalancheCooldownMs
+              : mlSettings.maxCooldownMs,
           scope: usesExactAntigravityLock ? "exact" : undefined,
           // Only a transport header, google.rpc.RetryInfo, or cached Claude reset can bypass
           // maxCooldownMs. Prose and generic JSON hints remain exact but operator-capped.
@@ -3170,7 +3179,10 @@ export async function markAccountUnavailable(
         cooldownMs: lockout.cooldownMs,
         reason,
       });
-      return { shouldFallback: true, cooldownMs: lockout.cooldownMs };
+      return {
+        shouldFallback: options.suppressFallback ? false : true,
+        cooldownMs: lockout.cooldownMs,
+      };
     }
     const result = fallbackResult;
     if (isSharedWalletCredits402(provider, status, errorText)) {
@@ -3180,6 +3192,12 @@ export async function markAccountUnavailable(
     }
     const { shouldFallback, cooldownMs: rawCooldownMs, newBackoffLevel, reason } = result;
     if (!shouldFallback) return { shouldFallback: false, cooldownMs: 0 };
+    if (options.suppressFallback) {
+      return {
+        shouldFallback: false,
+        cooldownMs: options.avalancheCooldownMs ?? rawCooldownMs,
+      };
+    }
     const providerErrorType = classifyProviderError(status, errorText, provider);
 
     if (
