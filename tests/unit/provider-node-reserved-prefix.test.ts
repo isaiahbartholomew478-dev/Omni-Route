@@ -202,7 +202,11 @@ test("shared set size includes live REGISTRY and retired Designer + Felo + Qwen 
   // (413 -> 412). Measured, not hand-derived: RESERVED_PROVIDER_PREFIXES.size on this head.
   // origin/release/v3.8.52 already measures 413 (test still 412, inherited).
   // onomeo registers id "onomeo" with the same alias — one REGISTRY member (413 -> 414).
-  assert.equal(RESERVED_PREFIX_COUNT, 414);
+  // ainetcafe (#13862) registers id "ainetcafe" with the same alias — one more REGISTRY
+  // member (414 -> 415). Measured, not hand-derived: RESERVED_PROVIDER_PREFIXES.size on
+  // this head.
+  assert.equal(RESERVED_PREFIX_COUNT, 415);
+  assert.equal(RESERVED_PROVIDER_PREFIXES.has("ainetcafe"), true);
 });
 
 test("isReservedProviderPrefix rejects non-string input", () => {
